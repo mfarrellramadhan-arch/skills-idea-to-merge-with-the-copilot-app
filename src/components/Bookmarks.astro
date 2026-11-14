@@ -1,70 +1,259 @@
----
-// Bookmarks component (scaffold).
-//
-// The markup below renders during the static build. The dynamic behavior —
-// adding a bookmark, generating a short slug, and persisting to the browser —
-// must run ONLY in the client-side <script> boundary at the bottom of this
-// file. Astro runs that script in the browser, never during the build, so
-// browser-only APIs are safe there.
-//
-// You will implement the behavior in Step 3.
----
-<form id="add-bookmark">
+<section class="panel" aria-live="polite">
+  <h2 class="list-title">Connect Spotify</h2>
+  <p class="hint">Sign in to Spotify to load your top songs and start guessing.</p>
   <div class="field">
-    <label for="url">Link to save</label>
+    <label for="spotify-client-id">Spotify Client ID</label>
     <input
-      id="url"
-      name="url"
+      id="spotify-client-id"
+      name="spotify-client-id"
       type="text"
-      inputmode="url"
       autocomplete="off"
       spellcheck="false"
-      placeholder="https://example.com"
+      placeholder="Paste your Spotify app client ID"
       required
     />
   </div>
-  <button type="submit">Add bookmark</button>
-</form>
+  <button id="spotify-connect" type="button">Connect Spotify</button>
+  <p id="spotify-status" class="empty compact">Not connected yet.</p>
+</section>
 
-<p class="hint">Paste a URL and select <strong>Add bookmark</strong> to generate its short <code>mona-</code> slug.</p>
-
-<p id="empty-state" class="empty">No bookmarks yet — add your first link above.</p>
-
-<div id="list-header" hidden>
-  <h2 class="list-title">Saved bookmarks</h2>
-  <button id="clear-all" type="button" class="clear">Clear all</button>
-</div>
-
-<ul id="bookmark-list" aria-label="Saved bookmarks" aria-live="polite">
-  <!-- Bookmarks render here in the browser. -->
-</ul>
+<section id="game-panel" class="panel" hidden>
+  <h2 class="list-title">Guess the song</h2>
+  <p class="hint">Listen to the preview and choose the correct track title.</p>
+  <audio id="preview-player" controls preload="none"></audio>
+  <p id="round-meta" class="hint">Round 0 · Score 0</p>
+  <div id="choices" class="choices" role="group" aria-label="Song choices"></div>
+  <p id="result" class="empty compact">Press "New round" when you're ready.</p>
+  <button id="new-round" type="button" class="clear">New round</button>
+</section>
 
 <script>
-  // CLIENT-SIDE BOUNDARY — runs in the browser only.
-  //
-  // TODO (Step 3): implement the bookmarks feature here.
-  //   1. On form submit, call event.preventDefault() FIRST so the page
-  //      never reloads, then read and validate the original URL.
-  //   2. Generate a short slug with a "mona-" prefix (for example, base62
-  //      of a counter or hash → "mona-7fk2").
-  //   3. Save the original URL and its slug, then persist them in the browser.
-  //   4. Render each saved bookmark into #bookmark-list as a row (li.bookmark) with:
-  //        - the original URL as a link (.url) that opens in a new tab,
-  //        - its short slug shown as a badge (.slug), and
-  //        - a "Copy" button (.copy) that copies the slug.
-  //   5. Toggle empty vs. saved state: hide #empty-state and show #list-header
-  //      (the "Saved bookmarks" heading + "Clear all" button) once at least one
-  //      bookmark exists; reverse it when the list is empty.
-  //   6. Wire the #clear-all button to remove every saved bookmark (clear the
-  //      list, clear browser storage) after a quick confirm.
-  //   7. On page load, read the saved bookmarks from storage and render
-  //      them so the list persists across reloads.
-  //
-  // Because this code lives in a client <script>, browser storage APIs are
-  // safe to use here without breaking the static build.
-  const form = document.getElementById('add-bookmark');
-  form?.addEventListener('submit', (event) => {
-    event.preventDefault(); // keep this — stops the page from reloading
-    // Implement in Step 3.
-  });
+  const SCOPES = 'user-top-read';
+  const CLIENT_ID_KEY = 'spotify-client-id';
+  const PKCE_KEY = 'spotify-pkce-verifier';
+  const TOKEN_KEY = 'spotify-access-token';
+
+  const clientIdInput = document.getElementById('spotify-client-id');
+  const connectButton = document.getElementById('spotify-connect');
+  const status = document.getElementById('spotify-status');
+  const gamePanel = document.getElementById('game-panel');
+  const player = document.getElementById('preview-player');
+  const roundMeta = document.getElementById('round-meta');
+  const choices = document.getElementById('choices');
+  const result = document.getElementById('result');
+  const newRoundButton = document.getElementById('new-round');
+
+  const state = {
+    token: null,
+    tracks: [],
+    currentTrack: null,
+    score: 0,
+    round: 0,
+    guessed: false,
+  };
+
+  function getClientId() {
+    const fromInput = clientIdInput instanceof HTMLInputElement ? clientIdInput.value.trim() : '';
+    if (fromInput) {
+      window.localStorage.setItem(CLIENT_ID_KEY, fromInput);
+      return fromInput;
+    }
+    return window.localStorage.getItem(CLIENT_ID_KEY) ?? '';
+  }
+
+  function setStatus(message) {
+    if (status) {
+      status.textContent = message;
+    }
+  }
+
+  function updateRoundMeta() {
+    if (roundMeta) {
+      roundMeta.textContent = `Round ${state.round} · Score ${state.score}`;
+    }
+  }
+
+  function randomItems(pool, count, excludeId) {
+    const filtered = pool.filter((item) => item.id !== excludeId);
+    const shuffled = filtered.sort(() => Math.random() - 0.5);
+    return shuffled.slice(0, count);
+  }
+
+  function renderChoices(track) {
+    if (!choices) {
+      return;
+    }
+    const wrong = randomItems(state.tracks, 3, track.id);
+    const options = [track, ...wrong].sort(() => Math.random() - 0.5);
+    choices.innerHTML = '';
+    for (const option of options) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'copy choice';
+      button.textContent = option.name;
+      button.addEventListener('click', () => {
+        if (state.guessed) {
+          return;
+        }
+        state.guessed = true;
+        if (option.id === track.id) {
+          state.score += 1;
+          if (result) {
+            result.textContent = `✅ Correct! That was "${track.name}" by ${track.artists[0]?.name ?? 'Unknown artist'}.`;
+          }
+        } else if (result) {
+          result.textContent = `❌ Not quite. It was "${track.name}" by ${track.artists[0]?.name ?? 'Unknown artist'}.`;
+        }
+        updateRoundMeta();
+      });
+      choices.appendChild(button);
+    }
+  }
+
+  function startRound() {
+    if (!state.tracks.length || !player) {
+      return;
+    }
+    state.currentTrack = state.tracks[Math.floor(Math.random() * state.tracks.length)];
+    state.round += 1;
+    state.guessed = false;
+    updateRoundMeta();
+    if (result) {
+      result.textContent = 'Now playing a new preview. Make your guess.';
+    }
+    player.src = state.currentTrack.preview_url;
+    player.currentTime = 0;
+    player.play().catch(() => {});
+    renderChoices(state.currentTrack);
+  }
+
+  async function sha256(input) {
+    const data = new TextEncoder().encode(input);
+    return window.crypto.subtle.digest('SHA-256', data);
+  }
+
+  function base64url(buffer) {
+    return btoa(String.fromCharCode(...new Uint8Array(buffer)))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+  }
+
+  async function createChallenge(verifier) {
+    const digest = await sha256(verifier);
+    return base64url(digest);
+  }
+
+  function createVerifier() {
+    const random = new Uint8Array(32);
+    window.crypto.getRandomValues(random);
+    return base64url(random.buffer);
+  }
+
+  async function connectSpotify() {
+    const clientId = getClientId();
+    const redirectUri = window.location.origin + window.location.pathname;
+    if (!clientId) {
+      setStatus('Paste your Spotify Client ID to continue.');
+      return;
+    }
+    const verifier = createVerifier();
+    const challenge = await createChallenge(verifier);
+    window.localStorage.setItem(PKCE_KEY, verifier);
+    const params = new URLSearchParams({
+      client_id: clientId,
+      response_type: 'code',
+      redirect_uri: redirectUri,
+      scope: SCOPES,
+      code_challenge_method: 'S256',
+      code_challenge: challenge,
+    });
+    window.location.assign(`https://accounts.spotify.com/authorize?${params.toString()}`);
+  }
+
+  async function exchangeCodeForToken(code) {
+    const clientId = getClientId();
+    const redirectUri = window.location.origin + window.location.pathname;
+    const verifier = window.localStorage.getItem(PKCE_KEY);
+    if (!verifier || !clientId) {
+      return null;
+    }
+    const body = new URLSearchParams({
+      client_id: clientId,
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+    });
+    const response = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = await response.json();
+    if (!payload.access_token) {
+      return null;
+    }
+    window.localStorage.setItem(TOKEN_KEY, payload.access_token);
+    window.localStorage.removeItem(PKCE_KEY);
+    return payload.access_token;
+  }
+
+  async function fetchTracks(token) {
+    const response = await fetch('https://api.spotify.com/v1/me/top/tracks?limit=50&time_range=short_term', {
+      headers: { Authorization: 'Bearer ' + token },
+    });
+    if (!response.ok) {
+      throw new Error('Unable to fetch tracks.');
+    }
+    const payload = await response.json();
+    return (payload.items ?? []).filter((track) => track.preview_url);
+  }
+
+  async function init() {
+    if (clientIdInput instanceof HTMLInputElement) {
+      clientIdInput.value = window.localStorage.getItem(CLIENT_ID_KEY) ?? '';
+    }
+    const url = new URL(window.location.href);
+    const code = url.searchParams.get('code');
+    if (code) {
+      setStatus('Finishing Spotify sign in...');
+      const tokenFromCode = await exchangeCodeForToken(code);
+      url.searchParams.delete('code');
+      url.searchParams.delete('state');
+      window.history.replaceState({}, '', url.toString());
+      state.token = tokenFromCode;
+    } else {
+      state.token = window.localStorage.getItem(TOKEN_KEY);
+    }
+
+    if (!state.token) {
+      setStatus('Connect your Spotify account to begin.');
+      return;
+    }
+
+    setStatus('Connected. Loading songs...');
+    try {
+      state.tracks = await fetchTracks(state.token);
+      if (state.tracks.length < 4) {
+        setStatus('Need at least 4 previewable tracks in your Spotify top tracks.');
+        return;
+      }
+      if (gamePanel) {
+        gamePanel.hidden = false;
+      }
+      setStatus(`Connected. Loaded ${state.tracks.length} tracks with previews.`);
+      startRound();
+    } catch {
+      window.localStorage.removeItem(TOKEN_KEY);
+      setStatus('Could not load tracks. Reconnect Spotify to try again.');
+    }
+  }
+
+  connectButton?.addEventListener('click', connectSpotify);
+  newRoundButton?.addEventListener('click', startRound);
+  init();
 </script>
